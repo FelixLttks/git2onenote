@@ -1,6 +1,7 @@
 import os
 from configparser import SectionProxy
 from pathlib import Path
+from typing import Tuple
 
 from azure.identity import DeviceCodeCredential, TokenCachePersistenceOptions
 from kiota_abstractions.method import Method
@@ -24,13 +25,9 @@ class Graph:
         tenant_id = self.settings["tenantId"]
         graph_scopes = self.settings["graphUserScopes"].split(" ")
 
-        cache_options = TokenCachePersistenceOptions(name="my_graph_app_cache")
-
         self.device_code_credential = DeviceCodeCredential(
             client_id,
             tenant_id=tenant_id,
-            cache_options=cache_options,
-            cache_persistence_options=cache_options,
         )
         self.user_client = GraphServiceClient(self.device_code_credential, graph_scopes)
 
@@ -70,10 +67,27 @@ class Graph:
         ).pages.get()
         return pages
 
-    async def create_page_from_pdf(self, section_id: str, pdf_file_path: str):
+    async def create_page_from_pdf(
+        self,
+        section_id: str,
+        pdf_file_path: str = None,
+        raw_file: Tuple[str, bytes] = None,
+    ):
         url = f"https://graph.microsoft.com/v1.0/me/onenote/sections/{section_id}/pages"
 
-        file_name = Path(os.path.basename(pdf_file_path)).stem
+        if pdf_file_path is None and raw_file is None:
+            raise ValueError("Either pdf_file_path or raw_file must be provided")
+
+        if pdf_file_path is not None and raw_file is not None:
+            raise ValueError("Only one of pdf_file_path or raw_file can be provided")
+
+        is_raw_file = raw_file is not None
+
+        file_name = (
+            Path(os.path.basename(pdf_file_path)).stem
+            if not is_raw_file
+            else raw_file[0]
+        )
 
         html_content = f"""<!DOCTYPE html>
 <html>
@@ -88,17 +102,17 @@ class Graph:
         # Build the multipart files payload. httpx will automatically create a boundary.
         files = {
             "Presentation": (None, html_content, "text/html"),
-            "file-part": ("file.pdf", open(pdf_file_path, "rb"), "application/pdf"),
+            "file-part": (
+                "file.pdf",
+                open(pdf_file_path, "rb") if not is_raw_file else raw_file[1],
+                "application/pdf",
+            ),
         }
 
         m = MultipartEncoder(fields=files)
 
         # generate byte payload for the multipart/form-data
         byte_content = m.to_string()
-
-        # save byte_content as txt file
-        with open("tmp/byte_content.txt", "wb") as f:
-            f.write(byte_content)
 
         # generate request information with the files payload in multipart/form-data
         request_info = RequestInformation()

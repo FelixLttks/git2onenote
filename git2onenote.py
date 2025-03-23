@@ -2,11 +2,13 @@ import asyncio
 import configparser
 import datetime
 from configparser import SectionProxy
+from pathlib import Path
 
 from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 
 from git import Git
 from graph import Graph
+from web_server import WebServer
 
 
 async def sync(
@@ -34,22 +36,21 @@ async def sync(
         if file["name"][:-4] not in [page.title for page in onenote_pdf_files]
     ]
 
-    print("Missing files:")
+    if not missing_files:
+        print("No missing files to upload")
+        print("git_pdf_files:", [file["name"] for file in git_pdf_files])
+        print("onenote_pdf_files:", [page.title for page in onenote_pdf_files])
+        return
+
+    print("Uploading missing files:", [file["name"] for file in missing_files])
+
     for file in missing_files:
-        print(file)
+        raw_file = gitlab.get_file(file["path"])
 
-        # download file in temp folder
-        with open("tmp/" + file["name"], "wb+") as f:
-            raw_file = (
-                gitlab.get_project()
-                .files.get(file["path"], ref=gitlab.settings["branch"])
-                .decode()
-            )
-            f.write(raw_file)
+        file_name = Path(file["name"]).stem
 
-        # create page in OneNote
         await graph.create_page_from_pdf(
-            onenote_settings["section_id"], "tmp/" + file["name"]
+            onenote_settings["section_id"], raw_file=(file_name, raw_file)
         )
 
 
@@ -66,7 +67,13 @@ async def main():
 
     await greet_user(graph)
 
-    await sync(graph, gitlab, None, onenote_settings)
+    async def on_sync():
+        return await sync(graph, gitlab, None, onenote_settings)
+
+    web_server = WebServer()
+    web_server.run(on_sync)
+
+    # await sync(graph, gitlab, None, onenote_settings)
 
     choice = -1
 

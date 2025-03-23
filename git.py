@@ -37,3 +37,9 @@ class Git:
     def get_commits(self):
         commit = self.get_project().commits.list()
         return commit
+
+    def get_file(self, file_path, raw=True):
+        file = self.get_project().files.get(file_path, ref=self.settings["branch"])
+        if raw:
+            return file.decode()
+        return file
