@@ -33,3 +33,7 @@ class Git:
         if name_filter:
             items = [item for item in items if name_filter(item["name"])]
         return items
+
+    def get_commits(self):
+        commit = self.get_project().commits.list()
+        return commit
