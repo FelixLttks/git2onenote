@@ -1,6 +1,10 @@
+import ast
 import asyncio
 import configparser
 import datetime
+import re
+import threading
+import time
 from configparser import SectionProxy
 from pathlib import Path
 
@@ -8,6 +12,7 @@ from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 
 from git import Git
 from graph import Graph
+from scheduler import Scheduler
 from web_server import WebServer
 
 
@@ -15,43 +20,54 @@ async def sync(
     graph: Graph,
     gitlab: Git,
     last_sync: datetime.datetime,
-    onenote_settings: SectionProxy,
+    links: dict[int, str],
 ):
     print("Syncing...")
 
-    last_commit = gitlab.get_commits()[0]
-    if last_sync is not None and datetime.strptime(last_commit.created_at) < last_sync:
-        print("No new commits since last sync")
-        return
-
-    # Sync
-    git_pdf_files = gitlab.get_items(name_filter=lambda name: name.endswith(".pdf"))
-    onenote_pdf_files = (await graph.get_pages(onenote_settings["section_id"])).value
-
-    # Compare files by name
-    # ignore file extension
-    missing_files = [
-        file
-        for file in git_pdf_files
-        if file["name"][:-4] not in [page.title for page in onenote_pdf_files]
-    ]
-
-    if not missing_files:
-        print("No missing files to upload")
-        print("git_pdf_files:", [file["name"] for file in git_pdf_files])
-        print("onenote_pdf_files:", [page.title for page in onenote_pdf_files])
-        return
-
-    print("Uploading missing files:", [file["name"] for file in missing_files])
-
-    for file in missing_files:
-        raw_file = gitlab.get_file(file["path"])
-
-        file_name = Path(file["name"]).stem
-
-        await graph.create_page_from_pdf(
-            onenote_settings["section_id"], raw_file=(file_name, raw_file)
+    for link in links:
+        gitlab_id, onenote_section_id = link
+        print(
+            f"Syncing gitlab project {gitlab_id} to onenote section {onenote_section_id}"
         )
+
+        # Get last commit
+        last_commit = gitlab.get_commits(gitlab_id)[0]
+        if (
+            last_sync is not None
+            and datetime.strptime(last_commit.created_at) < last_sync
+        ):
+            print("No new commits since last sync")
+
+        # Sync
+        git_pdf_files = gitlab.get_items(
+            gitlab_id, name_filter=lambda name: name.endswith(".pdf")
+        )
+        onenote_pdf_files = (await graph.get_pages(onenote_section_id)).value
+
+        # Compare files by name
+        # ignore file extension
+        missing_files = [
+            file
+            for file in git_pdf_files
+            if file["name"][:-4] not in [page.title for page in onenote_pdf_files]
+        ]
+
+        if not missing_files:
+            print("No missing files to upload")
+            print("git_pdf_files:", [file["name"] for file in git_pdf_files])
+            print("onenote_pdf_files:", [page.title for page in onenote_pdf_files])
+            return
+
+        print("Uploading missing files:", [file["name"] for file in missing_files])
+
+        for file in missing_files:
+            raw_file = gitlab.get_file(gitlab_id, file["path"])
+
+            file_name = Path(file["name"]).stem
+
+            await graph.create_page_from_pdf(
+                onenote_section_id, raw_file=(file_name, raw_file)
+            )
 
 
 async def main():
@@ -60,7 +76,20 @@ async def main():
     config.read(["config.cfg", "config.dev.cfg"])
     azure_settings = config["azure"]
     gitlab_settings = config["GitLab"]
-    onenote_settings = config["OneNote"]
+
+    links_str = config.get("git2onenote", "links")
+
+    if not re.fullmatch(r"(\(\d+, [^)]+\),?\s*)+", links_str.strip()):
+        raise ValueError("Invalid links format")
+
+    matches = re.findall(r"\((\d+),\s*([^)]+)\)", links_str.strip())
+
+    # Converting to list of tuples (int, str)
+    links = [(int(num), text) for num, text in matches]
+    print("Found gitlab-onenote links:")
+    print("gitlab id - onenote section id")
+    for link in links:
+        print(link)
 
     graph: Graph = Graph(azure_settings)
     gitlab: Git = Git(gitlab_settings)
@@ -68,12 +97,12 @@ async def main():
     await greet_user(graph)
 
     async def on_sync():
-        return await sync(graph, gitlab, None, onenote_settings)
+        return await sync(graph, gitlab, None, links)
 
     web_server = WebServer()
     web_server.run(on_sync)
 
-    # await sync(graph, gitlab, None, onenote_settings)
+    Scheduler(on_sync, "07:55").run()
 
     choice = -1
 
@@ -82,11 +111,7 @@ async def main():
         print("0. Exit")
         print("1. Display access token")
         print("2. Select notebook")
-        print("3. List gitlab projects")
-        print("4. List gitlab items")
-        print("5. List PDF files")
-        print("6. List commits")
-        print("7. Sync")
+        print("3. Sync now")
 
         try:
             choice = int(input())
@@ -101,15 +126,7 @@ async def main():
             elif choice == 2:
                 await select_section(graph)
             elif choice == 3:
-                await list_gitlab_projects(gitlab)
-            elif choice == 4:
-                await list_gitlab_items(gitlab)
-            elif choice == 5:
-                await list_pdf_files(gitlab)
-            elif choice == 6:
-                await list_commits(gitlab)
-            elif choice == 7:
-                await sync(graph, gitlab, None, onenote_settings)
+                await sync(graph, gitlab, None, links)
             else:
                 print("Invalid choice!\n")
         except ODataError as odata_error:
@@ -172,42 +189,6 @@ async def select_section(graph: Graph):
     # Display pages with index
     for i, page in enumerate(pages.value):
         print(f"{i}. {page.title} - {page.id}")
-
-
-async def list_gitlab_projects(gitlab: Git):
-    projects = gitlab.get_projects()
-
-    if not projects:
-        print("No projects found.")
-        return
-
-    for project in projects:
-        print(f"{project.name} - {project.id}")
-
-
-async def list_gitlab_items(gitlab: Git):
-    items = gitlab.get_items()
-
-    if not items:
-        print("No items found.")
-        return
-
-    for item in items:
-        print(f"{item['name']} - {item['id']}")
-
-
-async def list_pdf_files(gitlab: Git):
-    items = gitlab.get_items(name_filter=lambda name: name.endswith(".pdf"))
-    for item in items:
-        print(f"{item['name']} - {item['id']}")
-
-
-async def list_commits(gitlab: Git):
-    commits = gitlab.get_commits()
-    for commit in commits:
-        print(
-            f"{commit.title} - {commit.id} - {commit.author_name} - {commit.created_at}"
-        )
 
 
 # Run main
